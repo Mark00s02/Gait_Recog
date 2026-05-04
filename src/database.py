@@ -1,7 +1,8 @@
-"""SQLite database for storing gait profiles and samples."""
+"""SQLite database for storing gait profiles, samples, and recognition log."""
 import sqlite3
 import numpy as np
 import os
+import csv
 from typing import List, Tuple, Optional, Dict
 
 
@@ -44,6 +45,12 @@ class GaitDatabase:
                 )
             """)
             conn.commit()
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(users)")]
+            if "photo" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN photo BLOB")
+                conn.commit()
+
+    # ── Users ─────────────────────────────────────────────────────────────────
 
     def add_user(self, name: str) -> int:
         with self._get_conn() as conn:
@@ -62,8 +69,24 @@ class GaitDatabase:
 
     def user_exists(self, name: str) -> bool:
         with self._get_conn() as conn:
+            return conn.execute("SELECT id FROM users WHERE name = ?", (name,)).fetchone() is not None
+
+    def set_user_photo(self, user_id: int, photo_bytes: bytes):
+        with self._get_conn() as conn:
+            conn.execute("UPDATE users SET photo = ? WHERE id = ?", (photo_bytes, user_id))
+            conn.commit()
+
+    def get_user_photo(self, user_id: int) -> Optional[bytes]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT photo FROM users WHERE id = ?", (user_id,)).fetchone()
+            return row[0] if row and row[0] else None
+
+    def get_user_id_by_name(self, name: str) -> Optional[int]:
+        with self._get_conn() as conn:
             row = conn.execute("SELECT id FROM users WHERE name = ?", (name,)).fetchone()
-            return row is not None
+            return row[0] if row else None
+
+    # ── Samples ───────────────────────────────────────────────────────────────
 
     def add_sample(self, user_id: int, features: np.ndarray) -> int:
         feats = features.astype(np.float32)
@@ -121,6 +144,8 @@ class GaitDatabase:
             ).fetchone()
         return row[0] if row else 0
 
+    # ── Recognition log ───────────────────────────────────────────────────────
+
     def log_recognition(self, name: str, confidence: float):
         with self._get_conn() as conn:
             conn.execute(
@@ -139,13 +164,86 @@ class GaitDatabase:
                 LIMIT ?
             """, (limit,)).fetchall()
 
+    def get_all_recognitions(self, limit: int = 1000, person: str = None) -> List[Tuple]:
+        with self._get_conn() as conn:
+            if person and person != "All":
+                return conn.execute("""
+                    SELECT predicted_name, confidence,
+                           strftime('%Y-%m-%d  %H:%M:%S', created_at) as dt
+                    FROM recognition_log
+                    WHERE predicted_name = ?
+                    ORDER BY created_at DESC LIMIT ?
+                """, (person, limit)).fetchall()
+            return conn.execute("""
+                SELECT predicted_name, confidence,
+                       strftime('%Y-%m-%d  %H:%M:%S', created_at) as dt
+                FROM recognition_log
+                ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
+
+    def get_unique_log_names(self) -> List[str]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT predicted_name FROM recognition_log ORDER BY predicted_name"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def get_log_stats(self) -> Dict:
+        with self._get_conn() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM recognition_log").fetchone()[0]
+            identified = conn.execute(
+                "SELECT COUNT(*) FROM recognition_log WHERE predicted_name != 'Unknown'"
+            ).fetchone()[0]
+            most_row = conn.execute("""
+                SELECT predicted_name FROM recognition_log
+                WHERE predicted_name != 'Unknown'
+                GROUP BY predicted_name ORDER BY COUNT(*) DESC LIMIT 1
+            """).fetchone()
+            avg_row = conn.execute(
+                "SELECT AVG(confidence) FROM recognition_log WHERE predicted_name != 'Unknown'"
+            ).fetchone()
+        return {
+            "total": total,
+            "identified": identified,
+            "rate": (identified / total * 100) if total > 0 else 0.0,
+            "most_freq": most_row[0] if most_row else "—",
+            "avg_conf": avg_row[0] if avg_row and avg_row[0] else 0.0,
+        }
+
+    def get_user_analytics(self, user_name: str) -> Dict:
+        with self._get_conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM recognition_log WHERE predicted_name = ?", (user_name,)
+            ).fetchone()[0]
+            avg_conf = conn.execute(
+                "SELECT AVG(confidence) FROM recognition_log WHERE predicted_name = ?", (user_name,)
+            ).fetchone()[0]
+            last_seen = conn.execute(
+                "SELECT strftime('%Y-%m-%d %H:%M', MAX(created_at)) FROM recognition_log WHERE predicted_name = ?",
+                (user_name,)
+            ).fetchone()[0]
+        return {
+            "total_recognitions": total,
+            "avg_confidence": avg_conf or 0.0,
+            "last_seen": last_seen or "Never",
+        }
+
+    def clear_recognition_log(self):
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM recognition_log")
+            conn.commit()
+
+    def export_log_csv(self, path: str):
+        rows = self.get_all_recognitions(limit=100000)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["DateTime", "Person", "Confidence"])
+            for name, conf, dt in rows:
+                writer.writerow([dt, name, f"{conf * 100:.1f}%"])
+
     def get_stats(self) -> Dict:
         with self._get_conn() as conn:
             user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             sample_count = conn.execute("SELECT COUNT(*) FROM gait_samples").fetchone()[0]
             recog_count = conn.execute("SELECT COUNT(*) FROM recognition_log").fetchone()[0]
-        return {
-            "users": user_count,
-            "samples": sample_count,
-            "recognitions": recog_count,
-        }
+        return {"users": user_count, "samples": sample_count, "recognitions": recog_count}
